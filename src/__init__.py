@@ -1,0 +1,1 @@
+__author__ = "Spencer Whitehead (whites5@rpi.edu)"
