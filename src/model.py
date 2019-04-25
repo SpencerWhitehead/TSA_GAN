@@ -11,6 +11,7 @@ import numpy as np
 import re
 import random
 import logging
+from pykalman import KalmanFilter
 
 logger = logging.getLogger()
 
@@ -405,6 +406,19 @@ class CharCNN(nn.Module):
                             for i in conv_outputs]
         outputs = torch.cat(max_pool_outputs, 1)
         return outputs
+
+
+class KalmanFilter():
+    def __init__(self, input_size, hidden_size, dropout_p=0.):
+        self.kf = KalmanFilter(
+                transition_matrices = torch.zeros(2,2), 
+                observation_matrices = [[0.1, 0.5], [-0.3, 0.0]]
+            )
+
+    def forward(self, input_embeddings, input_lengths=None):
+        self.kf = self.kf.em(input_embeddings, n_iter=5)
+        (filtered_state_means, filtered_state_covariances) = kf.filter(measurements)
+        (smoothed_state_means, smoothed_state_covariances) = kf.smooth(measurements)
 
 
 class Model(nn.Module):
