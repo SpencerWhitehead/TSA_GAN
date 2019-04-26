@@ -161,15 +161,18 @@ class EEGProcessor(BatchProcessor):
             batch.sort(key=lambda x: len(x), reverse=True)
 
         feature_size = len(batch[0][0])
-        max_len = max([len(batch[i]) for i in range(len(batch))])
+        seq_lens = [len(batch[i]) for i in range(len(batch))]
+        max_len = max()
         pad_batch = [batch[i] + [[self.padval] * feature_size] * (max_len - len(batch[i])) for i in range(len(batch))]
 
         pad_batch = torch.FloatTensor(pad_batch)
+        seq_lens = torch.LongTensor(seq_lens)
 
         if self.gpu:
             pad_batch = pad_batch.cuda()
+            seq_lens = seq_lens.cuda()
 
-        return pad_batch
+        return pad_batch, seq_lens
 
 
 def split_intervals(timeseries, divisions=None, feature_size=128):
@@ -250,8 +253,9 @@ def test_dataset():
             drop_last=False,
             collate_fn=processor.process
     ):
-        print(batch)
-        print(batch.size())
+        batch_data, seq_lens = batch
+        print(batch_data.size())
+        print(seq_lens.size())
         break
 
 

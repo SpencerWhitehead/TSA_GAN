@@ -11,12 +11,9 @@ from torch.nn.utils import clip_grad_norm_
 
 from argparse import ArgumentParser
 
-from torch.utils.data import DataLoader
-
-# from util import MTEvaluator
-import src.util as util
-from src.data import MTParser, ShardDynamicMTDataset, DynamicMTDataset, MTProcessor, count2vocab
-from src.model import Linears, CharCNN, Highway, Discriminator, EncoderRNN, DecoderRNN, RNNEncoderDecoder, load_embedding
+from torch.utils.data import DataLoade
+from src.data import EEGParser, DynamicEEGDataset, EEGProcessor
+from src.model import Discriminator, DecoderRNN, GANModel
 
 timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
 
@@ -35,26 +32,14 @@ argparser.add_argument('--test', nargs='+', help="Path to the test set file. " +
 argparser.add_argument('--log', help='Path to the log dir')
 argparser.add_argument('--model', help='Path to the model file')
 argparser.add_argument('--results', help="Path to results file")
-argparser.add_argument('--batch_size', default=10, type=int, help='Batch size')
+argparser.add_argument('--batch_size', default=32, type=int, help='Batch size')
 argparser.add_argument('--max_epoch', default=100, type=int)
-argparser.add_argument('--word_embed', nargs='*',
-                       help='Path to the pre-trained embedding file')
-argparser.add_argument('--word_embed_dim', type=int, default=100,
-                       help='Word embedding dimension')
-argparser.set_defaults(word_ignore_case=False)
-argparser.add_argument('--char_embed_dim', type=int, default=50,
-                       help='Character embedding dimension')
-argparser.add_argument('--charcnn_filters', default='2,25;3,25;4,25',
-                       help='Character-level CNN filters')
-argparser.add_argument('--charhw_layer', default=1, type=int)
-argparser.add_argument('--charhw_func', default='relu')
-argparser.add_argument('--use_highway', action='store_true')
-argparser.add_argument('--lstm_hidden_size', default=100, type=int,
+argparser.add_argument('--input_dim', type=int, default=128,
+                       help='Input dimension')
+argparser.add_argument('--hidden_size', default=256, type=int,
                        help='LSTM hidden state size')
 argparser.add_argument('--lstm_forget_bias', default=0, type=float,
                        help='LSTM forget bias')
-argparser.add_argument('--feat_dropout', default=.5, type=float,
-                       help='Word feature dropout probability')
 argparser.add_argument('--lstm_dropout', default=.5, type=float,
                        help='LSTM output dropout probability')
 argparser.add_argument('--lr', default=0.005, type=float,
@@ -106,7 +91,21 @@ logger.info('----------')
 # Data file
 logger.info('Loading data sets')
 
-parser = MTParser(num_to_zeros=True)
+parser = EEGParser()
+
+train_set = DynamicEEGDataset(
+    processed_seizure_fname,
+    processed_seizure_divisions_fname,
+    "train",
+    parser,
+    min_seq_len=4,
+    max_seq_len=6,
+    rando_divs=True,
+    cache_dir="./data",
+    cache_name="TEST",
+    delete_cache=True
+)
+
 train_set = DynamicMTDataset(args.train[0], args.train[1], "train", parser=parser,
                              max_seq_len=25, max_char_len=25)
 dev_set =  DynamicMTDataset(args.dev[0], args.dev[1], "dev", parser=parser,
@@ -115,108 +114,45 @@ test_set =  DynamicMTDataset(args.test[0], args.test[1], "test", parser=parser,
                              max_seq_len=25, max_char_len=25)
 datasets = {'train': train_set, 'dev': dev_set, 'test': test_set}
 
-# Vocabs
-logger.info('Building vocabs')
-l1_token_count, l1_char_count, l2_token_count, l2_char_count = Counter(), Counter(), Counter(), Counter()
-for _, ds in datasets.items():
-    l1tc, l1cc, l2tc, l2cc = ds.stats()
-    l1_token_count.update(l1tc)
-    l1_char_count.update(l1cc)
-    l2_token_count.update(l2tc)
-    l2_char_count.update(l2cc)
-l1_t_vocab = count2vocab(l1_token_count, offset=len(C.TOKEN_PADS), pads=C.TOKEN_PADS)
-l2_t_vocab = count2vocab(l2_token_count, offset=len(C.TOKEN_PADS), pads=C.TOKEN_PADS)
-char_vocab = count2vocab(l1_char_count + l2_char_count, offset=len(C.CHAR_PADS), pads=C.CHAR_PADS)
+dec = DecoderRNN(
+    input_size=args.input_dim,
+    hidden_size=args.hidden_size,
+    output_size=args.input_dim,
+    max_len=100,
+    n_layers=1,
+    rnn_cell_type="ylstm"
+)
 
-l1_idx_token = {v: k for k, v in l1_t_vocab.items()}
-l2_idx_token = {v: k for k, v in l2_t_vocab.items()}
-train_set.numberize(l1_t_vocab, l2_t_vocab, char_vocab)
-dev_set.numberize(l1_t_vocab, l2_t_vocab, char_vocab)
-test_set.numberize(l1_t_vocab, l2_t_vocab, char_vocab)
-logger.info('Language 1 #token: {}'.format(len(l1_t_vocab)))
-logger.info('Language 2 #token: {}'.format(len(l2_t_vocab)))
-logger.info('#char: {}'.format(len(char_vocab)))
+disc_labels = {"real": 1, "fake": 0}
+disc = Discriminator(
+    n_labels=len(disc_labels),
+    input_dim=dec.output_size,
+    n_layers=1,
+    hidden_size=dec.output_size,
+    dropout_p=0.
+)
 
 
-lang_vocab_sizes = [len(l1_t_vocab), len(l2_t_vocab)]
-lang_sos_idxs = [l2_t_vocab[C.SOS], l2_t_vocab[C.SOS]]
-lang_eos_idxs = [l2_t_vocab[C.EOS], l2_t_vocab[C.EOS]]
-lang_pad_idxs = [l2_t_vocab[C.PAD], l2_t_vocab[C.PAD]]
-
-# Embedding file
-if args.word_embed is not None:
-    l1_word_embed = load_embedding(args.word_embed[0],
-                                   dimension=args.word_embed_dim,
-                                   vocab=l1_t_vocab)
-    l2_word_embed = load_embedding(args.word_embed[1],
-                                   dimension=args.word_embed_dim,
-                                   vocab=l2_t_vocab)
-else:
-    l1_word_embed = torch.nn.Embedding(len(l1_t_vocab), args.word_embed_dim, padding_idx=C.PAD_INDEX, sparse=True)
-    l2_word_embed = torch.nn.Embedding(len(l2_t_vocab), args.word_embed_dim, padding_idx=C.PAD_INDEX, sparse=True)
-
-charcnn_filters = [[int(f.split(',')[0]), int(f.split(',')[1])]
-                   for f in args.charcnn_filters.split(';')]
-
-char_embed = CharCNN(len(char_vocab),
-                     args.char_embed_dim,
-                     filters=charcnn_filters)
-
-char_hw = Highway(char_embed.output_size,
-                  layer_num=args.charhw_layer,
-                  activation=args.charhw_func)
-
-feat_dim = l1_word_embed.embedding_dim + char_embed.output_size
-
-enc = EncoderRNN(input_size=feat_dim, hidden_size=args.lstm_hidden_size, dropout_p=0.,
-                 n_layers=1, bidirectional=True, rnn_cell="ylstm", variable_lengths=True)
-
-linear = Linears(in_features=enc.output_size,
-                 out_features=enc.output_size,
-                 hiddens=[enc.output_size // 2])
-
-dec = DecoderRNN(lang_vocab_sizes, l2_word_embed.embedding_dim, hidden_size=linear.output_size, max_len=25,
-                 n_layers=1, rnn_cell="ylstm", bidirectional=False, dropout_p=0.,
-                 use_attention=True, use_general_attn=True)
-
-disc = Discriminator(n_langs=2, input_dim=enc.output_size, n_layers=1, hidden_size=enc.output_size, dropout_p=0.)
-
-mt_model = RNNEncoderDecoder(lang_vocab_sizes, lang_sos_idxs, lang_eos_idxs, lang_pad_idxs, max_len=25,
-                             word_embedding_layers=[l1_word_embed, l2_word_embed],
-                             char_embedding=char_embed,
-                             encoder=enc,
-                             decoder=dec,
-                             discriminator=disc,
-                             univ_fc_layer=linear,
-                             spec_fc_layers=None,
-                             embed_dropout_prob=args.feat_dropout,
-                             encoder_out_dropout_prob=args.lstm_dropout,
-                             use_char_embedding=True,
-                             char_highway=char_hw if args.use_highway else None
-                             )
+gan_model = GANModel(decoder=dec, max_len=100, disc=discriminator, disc_labels=[0, 1])
 
 if use_gpu:
-    mt_model.cuda()
+    gan_model.cuda()
 torch.set_num_threads(args.thread)
 
-logger.debug(mt_model)
+logger.debug(gan_model)
 
 lam_auto = args.lambda_auto
 lam_cd = args.lambda_cd
 lam_adv = args.lambda_adv
 
-# Task
-# optimizer = optim.SGD(filter(lambda p: p.requires_grad, mt_model.parameters()),
-#                       lr=args.lr, momentum=args.momentum)
-
-no_disc_params = [p for m, p in mt_model.named_parameters()
+# Initialize optimizers
+no_disc_params = [p for m, p in gan_model.named_parameters()
                   if p.requires_grad and 'discriminator' not in m]
 optimizer = optim.SGD(no_disc_params,
                       lr=args.lr, momentum=args.momentum)
 dis_optimizer = optim.SGD(filter(lambda p: p.requires_grad, disc.parameters()),
                           lr=args.dis_lr, momentum=args.momentum)
-processor = MTProcessor(sort=False, gpu=use_gpu)
-evaluator = util.MTEvaluator()
+processor = EEGProcessor(sort=True, gpu=False, padval=0.)
 
 train_args = vars(args)
 train_args['word_embed_size'] = l1_word_embed.num_embeddings
