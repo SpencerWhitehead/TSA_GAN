@@ -202,7 +202,12 @@ def preprocess_data(data_fname="", data_name="seizure", output_dir="./data", fea
     with open(data_fname, "rb") as sf:
         ts_data = pickle.load(sf)
 
-    split_ts_data, split_divisions = split_intervals(ts_data[0], ts_data[1], feature_size=feature_size)
+    if len(ts_data) == 2:
+        division_dict = ts_data[1]
+    else:
+        division_dict = None
+
+    split_ts_data, split_divisions = split_intervals(ts_data[0], division_dict, feature_size=feature_size)
 
     with open(outfname, "w", encoding="utf-8") as sdatf:
         for ts_step_data in split_ts_data:
@@ -216,7 +221,11 @@ def test_dataset():
     seizure_fname = "./data/seizure_data.pkl"
     processed_seizure_fname = "./data/seizure.timeseries.txt"
     processed_seizure_divisions_fname = "./data/seizure.divisions.json"
-    preprocess_data(seizure_fname, feature_size=2)
+
+    normal_fname = "./data/normal.pkl"
+
+    preprocess_data(seizure_fname, data_name="seizure", feature_size=2)
+    preprocess_data(normal_fname, data_name="normal", feature_size=2)
 
     p = EEGParser()
     dataset = DynamicEEGDataset(
