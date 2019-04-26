@@ -1,11 +1,11 @@
 import os
-import re
 import torch
+import random
 import linecache
 import pickle
+import json
 
 import logging
-from collections import Counter, defaultdict
 from torch.utils.data import Dataset
 
 logger = logging.getLogger()
@@ -13,15 +13,7 @@ logger = logging.getLogger()
 
 class Parser(object):
     def __init__(self, **kwargs):
-        self.num2zeros = kwargs.pop('num_to_zeros', True)
-
-    def _prepro(self, curr_line):
-        prep_tokens = []
-        for tok in curr_line:
-            if self.num2zeros:
-                tok = re.sub('\d', '0', tok)
-            prep_tokens.append(tok)
-        return prep_tokens
+        pass
 
     def parse(self, path: str, **kwargs):
         raise NotImplementedError
@@ -35,70 +27,70 @@ class EEGParser(Parser):
     def parse(self,
               data_path: str,
               div_path: str = None):
-        l1r = open(l1_path, 'r', encoding='utf-8')
-        l2r = open(l2_path, 'r', encoding="utf-8")
+        f_iter = open(data_path, 'r', encoding="utf-8")
+        if div_path.endswith("json"):
+            with open(div_path, "r", encoding="utf-8") as divf:
+                divisions = json.load(divf)
+        else:
+            with open(div_path, "rb") as divf:
+                divisions = pickle.load(divf)
 
-        for ex in f_iter:
-            mt_example = []
-            for line in ex:
+        for div_id, div_range in divisions.items():
+            eeg_example = []
+            div_len = div_range[1] - div_range[0]
+            for _ in range(div_len):
+                line = f_iter.readline()
                 line = line.rstrip()
                 if line:
-                    tokens = self._prepro(line.split())
-                    mt_example.append(tokens)
-            if len(mt_example) == len(ex):
-                yield mt_example
+                    temp = [float(x) for x in line.split()]
+                    eeg_example.append(temp)
+            yield eeg_example
 
-        l1r.close()
-        if l2_path:
-            l2r.close()
+        f_iter.close()
 
 
 class DynamicEEGDataset(Dataset):
     def __init__(self,
-                 l1_path: str,
-                 l2_path: str,
+                 data_path: str,
+                 div_path: str,
                  phase_str: str,
                  parser: Parser,
+                 min_seq_len: int = 10,
                  max_seq_len: int = -1,
-                 max_char_len: int = -1,
+                 rando_divs: bool = False,
                  cache_dir: str = ".",
                  cache_name: str = "",
-                 delete_cache: bool = True,
-                 percent_data: float = 1.0):
-        self.l1_path = l1_path
-        self.l2_path = l2_path
+                 delete_cache: bool = True):
+        self.data_path = data_path
+        self.div_path = div_path
         self.parser = parser
+        self.min_seq_len = min_seq_len
         self.max_seq_len = max_seq_len
-        self.max_char_len = max_char_len
+        self.rando_divs = rando_divs
         self.data_size = 0
         if not cache_dir:
             cache_dir = "."
-        temp_cache_fname = "{0}.MTdata_cache".format(phase_str)
+        temp_cache_fname = "{0}.EEGdata_cache".format(phase_str)
         if cache_name:
             temp_cache_fname = (temp_cache_fname + ".{0}").format(cache_name)
         temp_cache_fname += ".pt"
         self.cache_fname = os.path.join(cache_dir, temp_cache_fname)
-        self.cache_delim = "|"
-        self.cache_token_delim = ":"
+        self.cache_step_delim= "|"
         self._delete_cache = delete_cache
-        self._data_percentage = percent_data
         self.load()
 
     def __getitem__(self,
                     idx: int):
         line = linecache.getline(self.cache_fname, idx + 1)
         try:
-            l1_tokens_, l1_chars_, l2_tokens_, l2_chars_ = line.rstrip().split(self.cache_delim)
+            ts_str_list = line.rstrip().split(self.cache_step_delim)
         except ValueError as e:
             self._delete_cache = False
             print("Error message: {}".format(e))
             print("IDX: {}".format(idx))
             print("Line: {}".format(line))
-            raise ValueError("MT dataset indexing error.")
-        return (self._numberized_tokens_to_int(l1_tokens_),
-                self._numberized_chars_to_int(l1_chars_),
-                self._numberized_tokens_to_int(l2_tokens_),
-                self._numberized_chars_to_int(l2_chars_))
+            raise ValueError("Dataset indexing error.")
+        return self._ts_to_float(ts_str_list)
 
     def __len__(self):
         return self.data_size
@@ -107,134 +99,45 @@ class DynamicEEGDataset(Dataset):
         if os.path.exists(self.cache_fname) and self._delete_cache:
             os.remove(self.cache_fname)
 
-    def save_data(self):
+    def _get_data_subset_idxs(self, n, rando=False):
+        if self.max_seq_len < 0:
+            yield n
+        else:
+            max_len = min(n, self.max_seq_len)
+            while n > self.min_seq_len:
+                if rando:
+                    r = random.randint(self.min_seq_len, max_len)
+                else:
+                    r = self.min_seq_len
+                yield r
+                n -= r
+            yield n
+
+    def get_data_subsets(self):
+        for ts in self.parser.parse(self.data_path, div_path=self.div_path):
+            ts_n = len(ts)
+            L = 0
+            for k in self._get_data_subset_idxs(ts_n, self.rando_divs):
+                yield ts[L:L+k]
+                L += k
+
+    def retain_cache(self):
         self._delete_cache = False
 
-    def _numberized_tokens_to_str(self, numb_tok):
-        return ' '.join(map(str, numb_tok))
+    def _ts_to_str(self, ts_step_list):
+        ts_step_strs = [' '.join(map(str, ts_step)) for ts_step in ts_step_list]
+        return self.cache_step_delim.join(ts_step_strs)
 
-    def _numberized_tokens_to_int(self, numb_tok_str):
-        return list(map(int, numb_tok_str.split()))
-
-    def _numberized_chars_to_str(self, numb_chars):
-        numb_chars_strs = [' '.join(map(str, char_list)) for char_list in numb_chars]
-        return self.cache_token_delim.join(numb_chars_strs)
-
-    def _numberized_chars_to_int(self, numb_chars_str):
-        token_list = numb_chars_str.split(self.cache_token_delim)
-        return list(list(map(int, tok.split())) for tok in token_list)
-
-    def _single_lang_numberize(self, tokens, token_vocab, char_vocab: dict = None, ignore_case: bool = False):
-        if ignore_case:
-            tokens_ = [t.lower() for t in tokens]
-            tokens_ = [token_vocab[t] if t in token_vocab
-                       else C.UNK_INDEX for t in tokens_]
-        else:
-            tokens_ = [token_vocab[t] if t in token_vocab
-                       else C.UNK_INDEX for t in tokens]
-        chars = None
-        if char_vocab:
-            chars = [[char_vocab[c] if c in char_vocab
-                      else C.UNK_INDEX for c in t] for t in tokens]
-        #     if self.max_seq_len > 0:
-        #         chars = chars[:self.max_seq_len]
-        # if self.max_seq_len > 0:
-        #     tokens_ = tokens_[:self.max_seq_len]
-        return tokens_, chars
-
-    def numberize(self,
-                  l1_token_vocab: dict,
-                  l2_token_vocab: dict,
-                  char_vocab: dict = None,
-                  ignore_case: bool = False):
-        num_examples = 0
-        with open(self.cache_fname, 'w', encoding='utf-8') as cf:
-            for i, (l1_tokens, l2_tokens) in enumerate(self.parser.parse(self.l1_path, l2_path=self.l2_path)):
-                if num_examples == self.data_size:
-                    break
-
-                if self.max_seq_len > 0 and (len(l1_tokens) > self.max_seq_len or len(l2_tokens) > self.max_seq_len):
-                    continue
-
-                l1_tokens_, l1_chars_ = self._single_lang_numberize(l1_tokens, l1_token_vocab,
-                                                                    char_vocab, ignore_case)
-                l1_tok_str = self._numberized_tokens_to_str(l1_tokens_)
-                l1_char_str = self._numberized_chars_to_str(l1_chars_)
-
-                l2_tokens_, l2_chars_ = self._single_lang_numberize(l2_tokens, l2_token_vocab,
-                                                                    char_vocab, ignore_case)
-                l2_tok_str = self._numberized_tokens_to_str(l2_tokens_)
-                l2_char_str = self._numberized_chars_to_str(l2_chars_)
-
-                cf.write(self.cache_delim.join([l1_tok_str, l1_char_str, l2_tok_str, l2_char_str]) + "\n")
-                num_examples += 1
-
-        logger.info("Saved numberized data (filename: {0}) with {1} examples.".format(self.cache_fname,
-                                                                                      num_examples))
+    def _ts_to_float(self, ts_str_list):
+        return list(list(map(float, ts_step.split())) for ts_step in ts_str_list)
 
     def load(self):
         num_examples = 0
-        for _ in self.parser.parse(self.l1_path, l2_path=self.l2_path):
-            num_examples += 1
-        self.data_size = int(num_examples * self._data_percentage)
-
-    def _single_lang_stats(self,
-                           tokens,
-                           token_ignore_case: bool = False,
-                           char_ignore_case: bool = False,
-                           ):
-        token_counter = Counter()
-        char_counter = Counter()
-        token_lower = [t.lower() for t in tokens]
-        if char_ignore_case:
-            for token in token_lower:
-                for c in token:
-                    char_counter[c] += 1
-        else:
-            for token in tokens:
-                for c in token:
-                    char_counter[c] += 1
-        if token_ignore_case:
-            token_counter.update(token_lower)
-        else:
-            token_counter.update(tokens)
-
-        return token_counter, char_counter
-
-    def stats(self,
-              token_ignore_case: bool = False,
-              char_ignore_case: bool = False,
-              ):
-        l1_token_counter = Counter()
-        l1_char_counter = Counter()
-        l2_token_counter = Counter()
-        l2_char_counter = Counter()
-
-        num_examples = 0
-        for i, (l1_tokens, l2_tokens) in enumerate(self.parser.parse(self.l1_path, l2_path=self.l2_path)):
-            if num_examples == self.data_size:
-                break
-
-            if self.max_seq_len > 0 and (len(l1_tokens) > self.max_seq_len or len(l2_tokens) > self.max_seq_len):
-                continue
-
-            curr_l1_tokens, curr_l1_chars = self._single_lang_stats(l1_tokens,
-                                                                    token_ignore_case,
-                                                                    char_ignore_case)
-            l1_token_counter += curr_l1_tokens
-            l1_char_counter += curr_l1_chars
-
-            curr_l2_tokens, curr_l2_chars = self._single_lang_stats(l2_tokens,
-                                                                    token_ignore_case,
-                                                                    char_ignore_case)
-            l2_token_counter += curr_l2_tokens
-            l2_char_counter += curr_l2_chars
-            num_examples += 1
-
-        if num_examples < self.data_size:
-            self.data_size = num_examples
-
-        return l1_token_counter, l1_char_counter, l2_token_counter, l2_char_counter
+        with open(self.cache_fname, 'w', encoding='utf-8') as cf:
+            for ts_sub in self.get_data_subsets():
+                cf.write(self._ts_to_str(ts_sub) + "\n")
+                num_examples += 1
+        self.data_size = num_examples
 
 
 class BatchProcessor(object):
@@ -245,67 +148,105 @@ class BatchProcessor(object):
 
 class EEGProcessor(BatchProcessor):
     def __init__(self,
-                 sort: bool = False,
+                 sort: bool = True,
                  gpu: bool = False,
-                 min_char_len: int = 4):
+                 padval: float = 0.0
+                 ):
         self.sort = sort
         self.gpu = gpu
+        self.padval = padval
 
-    def _single_lang_process(self, lang_batch_tokens, lang_batch_chars, padding_idx):
-        seq_lens = [len(x) for x in lang_batch_tokens]
-        max_seq_len = max(seq_lens)
+    def process(self, batch):
+        if self.sort:
+            batch.sort(key=lambda x: len(x), reverse=True)
 
-        char_lens = []
-        for bn in range(len(lang_batch_tokens)):
-            seq_char_lens = [len(x) for x in lang_batch_chars[bn]] + \
-                            [padding_idx] * (max_seq_len - len(lang_batch_tokens[bn]))
-            char_lens.extend(seq_char_lens)
-        max_char_len = max(max(char_lens), self.min_char_len)
+        feature_size = len(batch[0][0])
+        max_len = max([len(batch[i]) for i in range(len(batch))])
+        pad_batch = [batch[i] + [[self.padval] * feature_size] * (max_len - len(batch[i])) for i in range(len(batch))]
 
-        # Padding
-        batch_tokens = []
-        batch_chars = []
-        for bn in range(len(lang_batch_tokens)):
-            chars = lang_batch_chars[bn]
-            tokens = lang_batch_tokens[bn]
-            batch_tokens.append(tokens + [padding_idx] * (max_seq_len - len(tokens)))
-            batch_chars.extend(
-                [x + [0] * (max_char_len - len(x)) for x in chars]
-                # + [[0] * max_char_len] * (max_seq_len - len(tokens))
-                + [[0] * max_char_len for _ in range(max_seq_len - len(tokens))]
-            )
-            # batch_chars.extend([x + [0] * (max_char_len - len(x)) for x in chars]
-            #                    + [[0] * max_char_len] * (max_seq_len - len(tokens)))
-
-        batch_tokens = torch.LongTensor(batch_tokens)
-        batch_chars = torch.LongTensor(batch_chars)
-        seq_lens = torch.LongTensor(seq_lens)
-        char_lens = torch.LongTensor(char_lens)
+        pad_batch = torch.FloatTensor(pad_batch)
 
         if self.gpu:
-            batch_tokens = batch_tokens.cuda()
-            batch_chars = batch_chars.cuda()
-            seq_lens = seq_lens.cuda()
-            char_lens = char_lens.cuda()
+            pad_batch = pad_batch.cuda()
 
-        return batch_tokens, batch_chars, seq_lens, char_lens
+        return pad_batch
 
-    def process(self, batch: list):
-        padding_idx = self.padding_idx
-        if self.sort:
-            batch.sort(key=lambda x: len(x[0]), reverse=True)
 
-        l1_tokens, l1_chars, l2_tokens, l2_chars = zip(*batch)
+def split_intervals(timeseries, divisions=None, feature_size=128):
+    assert feature_size > 0
+    if divisions is None:
+        divisions = {"0": (0, len(timeseries))}
 
-        l1_batch_tokens, l1_batch_chars, \
-            l1_seq_lens, l1_char_lens = self._single_lang_process(l1_tokens,
-                                                                  l1_chars,
-                                                                  padding_idx)
+    sort_divisions = sorted(divisions.items(), key=lambda x: x[1][0])
+    split_timeseries = []
+    split_divisions = {}
+    split_start = 0
+    for div, (start, end) in sort_divisions:
+        n_splits = int((end - start) / feature_size)
 
-        l2_batch_tokens, l2_batch_chars, \
-            l2_seq_lens, l2_char_lens = self._single_lang_process(l2_tokens,
-                                                                  l2_chars,
-                                                                  padding_idx)
+        split_divisions[div] = (split_start, split_start + n_splits)
+        split_start += n_splits
 
-        return (l1_batch_tokens, l1_seq_lens, l1_batch_chars, l1_char_lens,
-                l2_batch_tokens, l2_seq_lens, l2_batch_chars, l2_char_lens)
+        for i in range(n_splits):
+            j = feature_size * i
+            k = j + feature_size
+            split_timeseries.append(list(timeseries[j:k]))
+
+    return split_timeseries, split_divisions
+
+
+def preprocess_data(data_fname="", data_name="seizure", output_dir="./data", feature_size=128):
+    outfname = os.path.join(output_dir, "{}.timeseries.txt".format(data_name))
+    divisions_outfname = os.path.join(output_dir, "{}.divisions.json".format(data_name))
+
+    with open(data_fname, "rb") as sf:
+        ts_data = pickle.load(sf)
+
+    split_ts_data, split_divisions = split_intervals(ts_data[0], ts_data[1], feature_size=feature_size)
+
+    with open(outfname, "w", encoding="utf-8") as sdatf:
+        for ts_step_data in split_ts_data:
+            sdatf.write(" ".join([str(x) for x in ts_step_data]) + "\n")
+
+    with open(divisions_outfname, "w", encoding="utf-8") as sdf:
+        json.dump(split_divisions, sdf)
+
+
+def test_dataset():
+    seizure_fname = "./data/seizure_data.pkl"
+    processed_seizure_fname = "./data/seizure.timeseries.txt"
+    processed_seizure_divisions_fname = "./data/seizure.divisions.json"
+    preprocess_data(seizure_fname, feature_size=2)
+
+    p = EEGParser()
+    dataset = DynamicEEGDataset(
+        processed_seizure_fname,
+        processed_seizure_divisions_fname,
+        "train",
+        p,
+        min_seq_len=4,
+        max_seq_len=6,
+        rando_divs=True,
+        cache_dir="./data",
+        cache_name="TEST",
+        delete_cache=True
+    )
+
+    processor = EEGProcessor(sort=True, gpu=False, padval=0.)
+
+    for batch in DataLoader(
+            dataset,
+            batch_size=3,
+            shuffle=False,
+            drop_last=False,
+            collate_fn=processor.process
+    ):
+        print(batch)
+        print(batch.size())
+        break
+
+
+if __name__ == "__main__":
+    from torch.utils.data import DataLoader
+
+    test_dataset()
