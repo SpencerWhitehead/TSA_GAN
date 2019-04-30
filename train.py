@@ -291,12 +291,12 @@ try:
                 epoch_loss.append(loss.cpu().detach().item())
 
             epoch_loss = sum(epoch_loss) / len(epoch_loss)
-            logger.info("{} Loss: {:.4f}".format(ds, epoch_loss))
-            logger.info("{} epoch time: {:.4f}".format(ds, time.time() - epoch_start_t))
+            logger.info("{} Loss: {}".format(ds, epoch_loss))
+            logger.info("{} epoch time: {}".format(ds, time.time() - epoch_start_t))
 
             if ds == "dev" or ds == "test":
                 if ds == "dev" and epoch_loss < best_dev_loss:
-                    logger.info("New best dev loss: {:.4f}".format(epoch_loss))
+                    logger.info("New best dev loss: {}".format(epoch_loss))
                     best_dev_loss = epoch_loss
                     best = True
                     logger.info(
