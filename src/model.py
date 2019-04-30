@@ -3,12 +3,10 @@ import torch.nn as nn
 import torch.nn.init as I
 import torch.nn.functional as F
 
-import numpy as np
-
-import random
 import logging
 
 import src.constants as C
+
 
 logger = logging.getLogger()
 
@@ -65,7 +63,6 @@ class Linears(nn.Module):
                                       for in_dim, out_dim
                                       in zip(in_dims, hiddens)])
         self.output_linear = Linear(hiddens[-1], out_features, bias=bias)
-        # self.activation = getattr(F, activation)
         self.activation = getattr(torch, activation)
 
     def forward(self, inputs):
@@ -196,7 +193,8 @@ class GeneratorRNN(BaseRNN):
                  rnn_cell_type: str = "ylstm",
                  dropout_p: float = 0.,
                  noise_size: int = 0,
-                 cond_size: int = 0
+                 cond_size: int = 0,
+                 use_kalman: bool = False
                  ):
         super(GeneratorRNN, self).__init__(input_size, hidden_size, n_layers, rnn_cell_type)
         self.output_size = output_size
@@ -204,7 +202,7 @@ class GeneratorRNN(BaseRNN):
         self.cond_size = cond_size
 
         self.rnn = self.rnn_cell(
-            input_size + noise_size + cond_size,
+            input_size,
             hidden_size,
             n_layers,
             batch_first=True,
@@ -243,6 +241,7 @@ class GANModel(Model):
                  max_len: int,
                  min_val: float,
                  max_val: float,
+                 use_cond_in: bool = True,
                  one_hot_cond: bool = True
                  ):
         super(GANModel, self).__init__()
@@ -254,16 +253,15 @@ class GANModel(Model):
         self.n_disc_labels = 2
         self.min_val = min_val
         self.max_val = max_val
+        self.use_cond_in = use_cond_in
         self.one_hot_cond = one_hot_cond
 
     def calc_adv_loss(self, decode_out):
         dis_loss = None
         if self.discriminator is not None:
-            self.discriminator.eval()
             if self.discriminator.DISC_MODEL == "FC":
                 dis_preds = self.discriminator(decode_out.view(-1, decode_out.size(-1)))
                 tgt_size = dis_preds.size(0)
-
             else:
                 dis_preds = self.discriminator(decode_out)
                 tgt_size = dis_preds.size(0) * dis_preds.size(1)
@@ -276,20 +274,16 @@ class GANModel(Model):
             dis_loss = F.cross_entropy(dis_preds, gen_tgt)
         return dis_loss
 
-    def discriminator_step(self, inputs, input_lens, teacher_forching_ratio=0.):
+    def discriminator_step(self, inputs, input_lens):
         if self.discriminator is None:
             return None
-
-        self.generator.eval()
-        self.discriminator.train()
 
         disc_labels = [self.real_label, self.fake_label]
 
         with torch.no_grad():
             decode_out = self.decode(
                 inputs=inputs,
-                input_lens=input_lens,
-                teacher_forcing_ratio=teacher_forching_ratio
+                input_lens=input_lens
             )
         batch_size, gen_seq_len, dim = decode_out.size()
 
@@ -335,46 +329,31 @@ class GANModel(Model):
             target = target.cuda()
 
         discriminator_loss = F.cross_entropy(predictions, target)
-        self.generator.train()
-        self.discriminator.eval()
         return discriminator_loss
 
-    def decode(self, init_generator_hidden=None, inputs=None, input_lens=None, teacher_forcing_ratio=0.):
-        adj_inputs, batch_size, max_length = self._validate_args(inputs, input_lens, teacher_forcing_ratio)
-
+    def decode(self, inputs=None, input_lens=None, init_generator_hidden=None):
+        adj_inputs, batch_size, max_length = self.sample_inputs(inputs, input_lens)
         generator_hidden = init_generator_hidden
-        use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
 
-        # Manual unrolling is used to support random teacher forcing.
-        # If teacher_forcing_ratio is True or False instead of a probability, the unrolling can be done in graph
-        if use_teacher_forcing:
-            all_step_generator_outputs, generator_hidden = self.generator(adj_inputs[:, :-1], generator_hidden)
-        else:
-            all_step_generator_outputs = []
-            generator_output = adj_inputs[:, 0].unsqueeze(1)
-            for di in range(max_length):
-                generator_output, generator_hidden = self.generator(generator_output, generator_hidden)
-                all_step_generator_outputs.append(generator_output.squeeze(1))
-
-            all_step_generator_outputs = torch.stack(all_step_generator_outputs, dim=1)
+        all_step_generator_outputs, generator_hidden = self.generator(adj_inputs, generator_hidden)
 
         return all_step_generator_outputs
 
-    def forward_model(self, inputs, input_lens=None, teacher_forcing_ratio=0.):
-        dec_outputs = self.decode(inputs=inputs, input_lens=input_lens, teacher_forcing_ratio=teacher_forcing_ratio)
+    def forward_model(self, inputs, input_lens=None):
+        dec_outputs = self.decode(inputs=inputs, input_lens=input_lens)
         return dec_outputs
 
-    def predict(self, inputs=None, input_lens=None, teacher_forcing_ratio=0., use_pred_loss=False):
+    def predict(self, inputs=None, input_lens=None, use_pred_loss=False):
         self.eval()
         with torch.no_grad():
             logits, loss, adv_loss = self.calc_loss(
-                inputs, input_lens, teacher_forcing_ratio=teacher_forcing_ratio, use_pred_loss=use_pred_loss
+                inputs, input_lens, use_pred_loss=use_pred_loss
             )
         self.train()
         return logits, loss, adv_loss
 
-    def calc_loss(self, inputs, input_lens, teacher_forcing_ratio=1., use_pred_loss=False):
-        logits = self.forward_model(inputs, input_lens, teacher_forcing_ratio)
+    def calc_loss(self, inputs, input_lens, use_pred_loss=False):
+        logits = self.forward_model(inputs, input_lens)
 
         dec_loss, dis_loss = None, None
         if inputs is not None:
@@ -386,62 +365,52 @@ class GANModel(Model):
 
         return logits, dec_loss, dis_loss
 
-    def _validate_args(self, inputs, input_lens, teacher_forcing_ratio):
-        use_cuda = inputs.is_cuda
-
-        # inference batch size
+    def sample_inputs(self, inputs, input_lens):
         if inputs is None:
             batch_size = 1
-        else:
-            batch_size = inputs.size(0)
-
-        # set default input and max decoding length
-        if inputs is None:
-            if teacher_forcing_ratio > 0:
-                raise ValueError("Teacher forcing has to be disabled (set 0) when no inputs is provided.")
-            inputs = self.get_noise(batch_size, 1, self.generator.input_size, init_step=True)
-            if use_cuda:
-                inputs = inputs.cuda()
             max_length = self.max_length
         else:
+            batch_size = inputs.size(0)
             max_length = inputs.size(1)
-            inputs, input_lens = self._append_noise(inputs, input_lens, self.generator.input_size, use_cuda)
 
-        return inputs, batch_size, max_length
+        model_inputs = self.get_noise(
+            batch_size,
+            max_length,
+            self.generator.noise_size,
+            init_step=False
+        )
 
-    def _append_noise(self, inputs, input_lens, feat_dim, use_cuda=False):
-        if inputs is None:
-            return inputs, input_lens
+        if self.use_cond_in:
+            cond_inputs = self.get_cond(
+                batch_size,
+                max_length,
+                self.generator.cond_size,
+                max_sample_val=self.generator.cond_size
+            )
+            model_inputs = torch.cat([model_inputs, cond_inputs], dim=2)
 
-        batch_size = inputs.size(0)
-        noise_step = self.get_noise(batch_size, 1, feat_dim, init_step=True)
-        if use_cuda:
-            noise_step = noise_step.cuda()
+        if self.gpu:
+            model_inputs = model_inputs.cuda()
 
-        return torch.cat([noise_step, inputs], dim=1), input_lens + 1
+        return model_inputs, batch_size, max_length
 
-    def get_noise(self, batch_size, seq_len, feat_dim, init_step=False, use_cuda=False):
+    def get_noise(self, batch_size, seq_len, feat_dim, init_step=False):
         if init_step:
-            zn = (self.max_val - self.min_val) * torch.randn((batch_size, 1, feat_dim)) + self.min_val
+            zn = (self.max_val - self.min_val) * torch.randn((batch_size, 1, feat_dim), requires_grad=True)
+            zn += self.min_val
         else:
-            zn = torch.randn((batch_size, seq_len, feat_dim))
-
-        if use_cuda:
-            zn = zn.cuda()
+            zn = torch.randn((batch_size, seq_len, feat_dim), requires_grad=True)
 
         return zn
 
-    def get_cond(self, batch_size, seq_len, use_cuda=False):
+    def get_cond(self, batch_size, seq_len, feat_dim, max_sample_val):
         if self.one_hot_cond:
-            cn = np.zeros(shape=(batch_size, self.cond_dim))
-            # locations
-            labels = np.random.choice(self.cond_dim, batch_size)
-            cn[np.arange(batch_size), labels] = 1.
+            cn = torch.zeros((batch_size, feat_dim), requires_grad=True)
+            labels = torch.randint(feat_dim, (batch_size,)).unsqueeze(1)
+            cn = cn.scatter(1, labels, 1)
         else:
-            cn = np.random.choice(1, size=(batch_size, self.cond_dim))
+            cn = torch.randint(high=max_sample_val, size=(batch_size, feat_dim))
 
-        cn = torch.from_numpy(np.tile(np.expand_dims(cn, axis=1), (batch_size, seq_len, 1)))
-        if use_cuda:
-            cn = cn.cuda()
+        cn = cn.unsqueeze(1).repeat(1, seq_len, 1)
 
         return cn

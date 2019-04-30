@@ -46,8 +46,8 @@ argparser.add_argument("--max_epoch", default=100, type=int)
 argparser.add_argument("--min_seq_len", default=50, type=int, help="Min sequence length in data.")
 argparser.add_argument("--max_seq_len", default=50, type=int, help="Max sequence length in data.")
 argparser.add_argument("--rand_seq_len", action="store_true", help="Use random sequence lengths?")
-argparser.add_argument("--input_dim", type=int, default=128,
-                       help="Input dimension.")
+argparser.add_argument("--ts_dim", type=int, default=128,
+                       help="Dimension of each timestep vector.")
 argparser.add_argument("--noise_size", default=64, type=int,
                        help="Input noise vector size.")
 argparser.add_argument("--cond_size", default=16, type=int,
@@ -84,8 +84,12 @@ argparser.add_argument("--thread", default=5, type=int)
 argparser.add_argument("--delete_cache", action="store_true")
 argparser.add_argument("--use_prediction_loss", action="store_true",
                        help="Whether or not to use MSE loss on predicted time series.")
+argparser.add_argument("--use_cond", action="store_true",
+                       help="Whether or not to use a conditional vector.")
 argparser.add_argument("--use_1hot_cond", action="store_true",
-                       help="Whether or not to use 1-hot conditional vector.")
+                       help="If using a conditional vector, whether or not to use 1-hot conditional vector.")
+argparser.add_argument("--use_kalman", action="store_true",
+                       help="Whether or not to use a Kalman filter matrix at the output of the generator.")
 
 args = argparser.parse_args()
 
@@ -165,9 +169,9 @@ processor = EEGProcessor(sort=True, gpu=use_gpu)
 datasets = {"train": train_set, "dev": dev_set, "test": test_set}
 
 gen_net = GeneratorRNN(
-    input_size=args.input_dim,
+    input_size=args.noise_size if not args.use_cond else args.noise_size + args.cond_size,
     hidden_size=args.gen_hidden_size,
-    output_size=args.input_dim,
+    output_size=args.ts_dim,
     n_layers=args.n_gen_layers,
     rnn_cell_type="ylstm",
     dropout_p=args.gen_dropout_p,
@@ -191,6 +195,7 @@ gan_model = GANModel(
     max_len=min(30, args.max_seq_len),
     min_val=train_set.min_val,
     max_val=train_set.max_val,
+    use_cond_in=args.use_cond,
     one_hot_cond=args.use_1hot_cond
 )
 
@@ -231,6 +236,7 @@ try:
         for ds in ["train", "dev", "test"]:
             dataset = datasets[ds]
             epoch_loss = []
+            disc_epoch_loss = []
             results = []
 
             epoch_start_t = time.time()
@@ -252,6 +258,7 @@ try:
                     disc_loss.backward()
                     clip_grad_norm_(disc.parameters(), args.grad_clipping)
                     disc_optimizer.step()
+                    disc_epoch_loss.append(disc_loss.cpu().detach().item())
 
                     # Generator training step
                     optimizer.zero_grad()
@@ -275,7 +282,6 @@ try:
                     preds, gen_loss, adv_loss = gan_model.predict(
                         batch_ts_data,
                         batch_ts_lens,
-                        teacher_forcing_ratio=(0. if ds != "dev" else 1.),
                         use_pred_loss=args.use_prediction_loss
                     )
 
@@ -291,7 +297,12 @@ try:
                 epoch_loss.append(loss.cpu().detach().item())
 
             epoch_loss = sum(epoch_loss) / len(epoch_loss)
-            logger.info("{} Loss: {}".format(ds, epoch_loss))
+            logger.info("Generator {} Loss: {}".format(ds, epoch_loss))
+
+            if ds == "train":
+                disc_epoch_loss = sum(disc_epoch_loss) / len(disc_epoch_loss)
+                logger.info("Discriminator {} Loss: {}".format(ds, disc_epoch_loss))
+
             logger.info("{} epoch time: {}".format(ds, time.time() - epoch_start_t))
 
             if ds == "dev" or ds == "test":
@@ -304,6 +315,7 @@ try:
                     torch.save(state, model_file)
 
                 if best and ds == "test":
+                    logger.info("New best model test loss: {}".format(epoch_loss))
                     best_test_loss = epoch_loss
                     save_results(results, result_file, result_div_file)
 
