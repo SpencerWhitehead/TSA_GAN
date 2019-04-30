@@ -1,11 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.init as I
-import torch.nn.utils.rnn as R
 import torch.nn.functional as F
+
+import numpy as np
 
 import random
 import logging
+
+import src.constants as C
 
 logger = logging.getLogger()
 
@@ -80,9 +83,9 @@ class LSTM(nn.LSTM):
                  num_layers: int = 1,
                  bias: bool = True,
                  batch_first: bool = False,
-                 dropout: float = 0,
+                 dropout: float = 0.,
                  bidirectional: bool = False,
-                 forget_bias: float = 0
+                 forget_bias: float = 0.
                  ):
         super(LSTM, self).__init__(input_size=input_size,
                                    hidden_size=hidden_size,
@@ -101,31 +104,6 @@ class LSTM(nn.LSTM):
             elif 'bias' in n:
                 bias_size = p.size(0)
                 p[bias_size // 4:bias_size // 2].fill_(self.forget_bias)
-
-
-class Discriminator(nn.Module):
-    def __init__(self, n_labels, input_dim, n_layers, hidden_size, dropout_p):
-        super(Discriminator, self).__init__()
-
-        self.n_labels = n_labels
-        self.input_dim = input_dim
-        self.n_layers = n_layers
-        self.hidden_dim = hidden_size
-        self.dropout_p = dropout_p
-
-        layers = []
-        for i in range(self.n_layers + 1):
-            if i != 0:
-                input_dim = self.hidden_dim
-            output_dim = self.hidden_dim if i < self.n_layers else self.n_labels
-            layers.append(nn.Linear(input_dim, output_dim))
-            if i < self.n_layers:
-                layers.append(nn.LeakyReLU(0.2))
-                layers.append(nn.Dropout(self.dropout_p))
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, input):
-        return self.layers(input)
 
 
 class BaseRNN(nn.Module):
@@ -147,20 +125,95 @@ class BaseRNN(nn.Module):
         raise NotImplementedError()
 
 
-class DecoderRNN(BaseRNN):
-    def __init__(self, input_size: int, hidden_size: int, output_size: int, max_len: int = 100,
-                 n_layers: int = 1, rnn_cell_type: str = "ylstm", bidirectional: bool = False, dropout_p: float = 0.):
-        if bidirectional:
-            hidden_size *= 2
+class FCDiscriminator(nn.Module):
 
-        super(DecoderRNN, self).__init__(input_size, hidden_size, n_layers, rnn_cell_type)
+    DISC_MODEL = "FC"
+
+    def __init__(self,
+                 input_size: int,
+                 hidden_size: int,
+                 n_labels: int,
+                 n_layers: int,
+                 dropout_p: float = 0.,
+                 **kwargs
+                 ):
+        super(FCDiscriminator, self).__init__()
+
+        self.input_size = input_size
+        self.hidden_size= hidden_size
+        self.output_size = n_labels
+        self.n_layers = n_layers
+        self.dropout_p = dropout_p
+
+        layers = []
+        input_dim = input_size
+        for i in range(self.n_layers + 1):
+            if i != 0:
+                input_dim = self.hidden_size
+            output_dim = self.hidden_size if i < self.n_layers else self.output_size
+            layers.append(nn.Linear(input_dim, output_dim))
+            if i < self.n_layers:
+                layers.append(nn.LeakyReLU(0.2))
+                layers.append(nn.Dropout(self.dropout_p))
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, inputs, **kwargs):
+        return self.layers(inputs)
+
+
+class RNNDiscriminator(BaseRNN):
+
+    DISC_MODEL = "RNN"
+
+    def __init__(self,
+                 input_size: int,
+                 hidden_size: int,
+                 n_labels: int,
+                 n_layers: int = 1,
+                 dropout_p: float = 0.,
+                 rnn_cell_type: str = "ylstm"
+                 ):
+        super(RNNDiscriminator, self).__init__(input_size, hidden_size, n_layers, rnn_cell_type)
+
+        self.output_size = n_labels
+        self.dropout_p = dropout_p
 
         self.rnn = self.rnn_cell(input_size, hidden_size, n_layers, batch_first=True, dropout=dropout_p)
-        self.max_length = max_len
+        self.out_layer = Linear(hidden_size, n_labels)
+
+    def forward(self, inputs, init_hidden=None):
+        out_states, hidden = self.rnn(inputs, init_hidden)
+        outputs = self.out_layer(out_states.contiguous())
+        return outputs
+
+
+class GeneratorRNN(BaseRNN):
+    def __init__(self,
+                 input_size: int,
+                 hidden_size: int,
+                 output_size: int,
+                 n_layers: int = 1,
+                 rnn_cell_type: str = "ylstm",
+                 dropout_p: float = 0.,
+                 noise_size: int = 0,
+                 cond_size: int = 0
+                 ):
+        super(GeneratorRNN, self).__init__(input_size, hidden_size, n_layers, rnn_cell_type)
+        self.output_size = output_size
+        self.noise_size = noise_size
+        self.cond_size = cond_size
+
+        self.rnn = self.rnn_cell(
+            input_size + noise_size + cond_size,
+            hidden_size,
+            n_layers,
+            batch_first=True,
+            dropout=dropout_p
+        )
         self.out_layer = Linear(hidden_size, output_size)
 
-    def forward(self, input_embeddings, init_decoder_hidden, encoder_outputs=None, encoder_lens=None):
-        out_states, hidden = self.rnn(input_embeddings, init_decoder_hidden)
+    def forward(self, inputs, init_hidden):
+        out_states, hidden = self.rnn(inputs, init_hidden)
         outputs = self.out_layer(out_states.contiguous())
         return outputs, hidden
 
@@ -185,97 +238,151 @@ class Model(nn.Module):
 
 class GANModel(Model):
     def __init__(self,
-                 decoder,
-                 max_len,
+                 generator,
                  discriminator,
-                 disc_labels):
+                 max_len: int,
+                 min_val: float,
+                 max_val: float,
+                 one_hot_cond: bool = True
+                 ):
         super(GANModel, self).__init__()
         self.discriminator = discriminator
-        self.decoder = decoder
+        self.generator = generator
         self.max_length = max_len
-        self.disc_labels = disc_labels
-        self.n_disc_labels = len(disc_labels)
+        self.real_label = 1
+        self.fake_label = 0
+        self.n_disc_labels = 2
+        self.min_val = min_val
+        self.max_val = max_val
+        self.one_hot_cond = one_hot_cond
 
-    def calc_adv_loss(self, label_id, decode_out):  # lang_id should be language that was given to the encoder.
+    def calc_adv_loss(self, decode_out):
         dis_loss = None
         if self.discriminator is not None:
             self.discriminator.eval()
-            with torch.no_grad():
+            if self.discriminator.DISC_MODEL == "FC":
                 dis_preds = self.discriminator(decode_out.view(-1, decode_out.size(-1)))
-            gen_tgt = ((torch.LongTensor(dis_preds.size(0)).random_(1, self.n_disc_labels) + label_id)
-                            % self.n_disc_labels)
+                tgt_size = dis_preds.size(0)
+
+            else:
+                dis_preds = self.discriminator(decode_out)
+                tgt_size = dis_preds.size(0) * dis_preds.size(1)
+                dis_preds = torch.transpose(dis_preds, 1, 2)
+
+            gen_tgt = ((torch.LongTensor(tgt_size).random_(1, self.n_disc_labels) + self.real_label)
+                       % self.n_disc_labels).view(dis_preds.size(0), -1).squeeze(1)
             if dis_preds.is_cuda:
                 gen_tgt = gen_tgt.cuda()
             dis_loss = F.cross_entropy(dis_preds, gen_tgt)
         return dis_loss
 
-    def discriminator_step(self, inputs, input_lens):
+    def discriminator_step(self, inputs, input_lens, teacher_forching_ratio=0.):
         if self.discriminator is None:
             return None
 
-        self.encoder.eval()
+        self.generator.eval()
         self.discriminator.train()
 
-        disc_labels = [1, 0]
-        decoded = [inputs]
+        disc_labels = [self.real_label, self.fake_label]
 
         with torch.no_grad():
-            decode_out = self.decode(inputs=inputs, input_lens=input_lens, teacher_forcing_ratio=0)
-        batch_size, seq_len, dim = decode_out.size()
-        mask = sequence_mask(input_lens, max_len=seq_len).unsqueeze(2).expand(batch_size, seq_len, dim)
-        disc_inputs = decode_out.masked_select(mask).view(input_lens.sum().item(), dim)
-        decoded.append(disc_inputs)
+            decode_out = self.decode(
+                inputs=inputs,
+                input_lens=input_lens,
+                teacher_forcing_ratio=teacher_forching_ratio
+            )
+        batch_size, gen_seq_len, dim = decode_out.size()
 
-        all_disc_inputs = [x.view(-1, x.size(-1)) for x in decoded]
-        n_steps = [x.size(0) for x in all_disc_inputs]
-        decoded = torch.cat(all_disc_inputs, 0)
-        predictions = self.discriminator(decoded.data)
+        if self.discriminator.DISC_MODEL == "FC":
+            mask = sequence_mask(input_lens, max_len=gen_seq_len).unsqueeze(2).expand(batch_size, gen_seq_len, dim)
+            disc_inputs = decode_out.masked_select(mask).view(input_lens.sum().item(), dim)
+            decoded = [inputs, disc_inputs]
 
-        target = torch.cat([torch.zeros(sz).fill_(disc_labels[i]) for i, sz in enumerate(n_steps)])
+            all_disc_inputs = [x.view(-1, x.size(-1)) for x in decoded]
+            n_steps = [x.size(0) for x in all_disc_inputs]
+            decoded = torch.cat(all_disc_inputs, 0)
+            target = torch.cat([torch.zeros(sz).fill_(disc_labels[i]) for i, sz in enumerate(n_steps)])
+            predictions = self.discriminator(decoded.detach().data)
+        else:
+            decoded = [inputs, decode_out]
+            decoded_lens = [x.size(1) for x in decoded]
+            diff_len = abs(decoded_lens[0] - decoded_lens[1])
+            min_len_idx = decoded_lens.index(min(decoded_lens))
+
+            if diff_len:
+                pad_min_decoded = F.pad(decoded[min_len_idx], [1, diff_len, 0], "constant", C.padval)
+            else:
+                pad_min_decoded = decoded[min_len_idx]
+
+            if min_len_idx == 0:
+                decoded = torch.cat([pad_min_decoded, decode_out], dim=0)
+                real_len = pad_min_decoded.size(1)
+                fake_len = gen_seq_len
+            else:
+                decoded = torch.cat([inputs, pad_min_decoded], dim=0)
+                real_len = inputs.size(1)
+                fake_len = pad_min_decoded.size(1)
+
+            real_tgt = torch.zeros(batch_size, real_len).fill_(self.real_label)
+            fake_tgt = torch.zeros(batch_size, fake_len).fill_(self.fake_label)
+            target = torch.cat([real_tgt, fake_tgt], dim=0)
+
+            predictions = self.discriminator(decoded.detach().data)
+            predictions = torch.transpose(predictions, 1, 2)
+
         target = target.contiguous().long()
         if predictions.is_cuda:
             target = target.cuda()
+
         discriminator_loss = F.cross_entropy(predictions, target)
-        self.encoder.train()
+        self.generator.train()
         self.discriminator.eval()
         return discriminator_loss
 
-    def decode(self, init_decoder_hidden=None, inputs=None, input_lens=None, teacher_forcing_ratio=0):
-        inputs, batch_size, max_length = self._validate_args(inputs, input_lens, teacher_forcing_ratio)
+    def decode(self, init_generator_hidden=None, inputs=None, input_lens=None, teacher_forcing_ratio=0.):
+        adj_inputs, batch_size, max_length = self._validate_args(inputs, input_lens, teacher_forcing_ratio)
 
-        decoder_hidden = init_decoder_hidden
+        generator_hidden = init_generator_hidden
         use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
 
         # Manual unrolling is used to support random teacher forcing.
         # If teacher_forcing_ratio is True or False instead of a probability, the unrolling can be done in graph
         if use_teacher_forcing:
-            all_step_decoder_outputs, decoder_hidden = self.decoder(inputs, decoder_hidden)
+            all_step_generator_outputs, generator_hidden = self.generator(adj_inputs[:, :-1], generator_hidden)
         else:
-            all_step_decoder_outputs = []
-            decoder_output = inputs
+            all_step_generator_outputs = []
+            generator_output = adj_inputs[:, 0].unsqueeze(1)
             for di in range(max_length):
-                decoder_output, decoder_hidden = self.decoder(decoder_output, decoder_hidden)
-                all_step_decoder_outputs.append(decoder_output)
+                generator_output, generator_hidden = self.generator(generator_output, generator_hidden)
+                all_step_generator_outputs.append(generator_output.squeeze(1))
 
-            all_step_decoder_outputs = torch.stack(all_step_decoder_outputs, dim=1)
+            all_step_generator_outputs = torch.stack(all_step_generator_outputs, dim=1)
 
-        return all_step_decoder_outputs
+        return all_step_generator_outputs
 
-    def forward_model(self, inputs, input_lens=None, teacher_forcing_ratio=0):
+    def forward_model(self, inputs, input_lens=None, teacher_forcing_ratio=0.):
         dec_outputs = self.decode(inputs=inputs, input_lens=input_lens, teacher_forcing_ratio=teacher_forcing_ratio)
         return dec_outputs
 
-    def predict(self, inputs=None, input_lens=None):
+    def predict(self, inputs=None, input_lens=None, teacher_forcing_ratio=0., use_pred_loss=False):
         self.eval()
         with torch.no_grad():
-            logits, loss, adv_loss = self.calc_loss(inputs, input_lens, teacher_forcing_ratio=0)
+            logits, loss, adv_loss = self.calc_loss(
+                inputs, input_lens, teacher_forcing_ratio=teacher_forcing_ratio, use_pred_loss=use_pred_loss
+            )
         self.train()
         return logits, loss, adv_loss
 
-    def calc_loss(self, label_id, inputs, input_lens, teacher_forcing_ratio=1):
+    def calc_loss(self, inputs, input_lens, teacher_forcing_ratio=1., use_pred_loss=False):
         logits = self.forward_model(inputs, input_lens, teacher_forcing_ratio)
-        dec_loss = F.mse_loss(logits, inputs)
-        dis_loss = self.calc_adv_loss(label_id, logits)
+
+        dec_loss, dis_loss = None, None
+        if inputs is not None:
+            if use_pred_loss:
+                dec_loss = F.mse_loss(logits, inputs)
+            else:
+                dec_loss = None
+            dis_loss = self.calc_adv_loss(logits)
 
         return logits, dec_loss, dis_loss
 
@@ -292,12 +399,49 @@ class GANModel(Model):
         if inputs is None:
             if teacher_forcing_ratio > 0:
                 raise ValueError("Teacher forcing has to be disabled (set 0) when no inputs is provided.")
-            # inputs = torch.FloatTensor([self.sos_id[lang_id]] * batch_size).view(batch_size, 1)
-            inputs = torch.randn((batch_size, self.decoder.input_size))
+            inputs = self.get_noise(batch_size, 1, self.generator.input_size, init_step=True)
             if use_cuda:
                 inputs = inputs.cuda()
             max_length = self.max_length
         else:
-            max_length = inputs.size(1)  # minus the start of sequence symbol
+            max_length = inputs.size(1)
+            inputs, input_lens = self._append_noise(inputs, input_lens, self.generator.input_size, use_cuda)
 
         return inputs, batch_size, max_length
+
+    def _append_noise(self, inputs, input_lens, feat_dim, use_cuda=False):
+        if inputs is None:
+            return inputs, input_lens
+
+        batch_size = inputs.size(0)
+        noise_step = self.get_noise(batch_size, 1, feat_dim, init_step=True)
+        if use_cuda:
+            noise_step = noise_step.cuda()
+
+        return torch.cat([noise_step, inputs], dim=1), input_lens + 1
+
+    def get_noise(self, batch_size, seq_len, feat_dim, init_step=False, use_cuda=False):
+        if init_step:
+            zn = (self.max_val - self.min_val) * torch.randn((batch_size, 1, feat_dim)) + self.min_val
+        else:
+            zn = torch.randn((batch_size, seq_len, feat_dim))
+
+        if use_cuda:
+            zn = zn.cuda()
+
+        return zn
+
+    def get_cond(self, batch_size, seq_len, use_cuda=False):
+        if self.one_hot_cond:
+            cn = np.zeros(shape=(batch_size, self.cond_dim))
+            # locations
+            labels = np.random.choice(self.cond_dim, batch_size)
+            cn[np.arange(batch_size), labels] = 1.
+        else:
+            cn = np.random.choice(1, size=(batch_size, self.cond_dim))
+
+        cn = torch.from_numpy(np.tile(np.expand_dims(cn, axis=1), (batch_size, seq_len, 1)))
+        if use_cuda:
+            cn = cn.cuda()
+
+        return cn
