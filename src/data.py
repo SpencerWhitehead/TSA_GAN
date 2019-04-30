@@ -4,9 +4,11 @@ import random
 import linecache
 import pickle
 import json
-
 import logging
+
 from torch.utils.data import Dataset
+
+import src.constants as C
 
 logger = logging.getLogger()
 
@@ -57,7 +59,7 @@ class DynamicEEGDataset(Dataset):
                  parser: Parser,
                  min_seq_len: int = 10,
                  max_seq_len: int = -1,
-                 rando_divs: bool = False,
+                 rando_ts_len: bool = False,
                  cache_dir: str = ".",
                  cache_name: str = "",
                  delete_cache: bool = True):
@@ -66,8 +68,10 @@ class DynamicEEGDataset(Dataset):
         self.parser = parser
         self.min_seq_len = min_seq_len
         self.max_seq_len = max_seq_len
-        self.rando_divs = rando_divs
+        self.rando_ts_len = rando_ts_len
         self.data_size = 0
+        self.min_val = None
+        self.max_val = None
         if not cache_dir:
             cache_dir = "."
         temp_cache_fname = "{0}.EEGdata_cache".format(phase_str)
@@ -117,7 +121,7 @@ class DynamicEEGDataset(Dataset):
         for ts in self.parser.parse(self.data_path, div_path=self.div_path):
             ts_n = len(ts)
             L = 0
-            for k in self._get_data_subset_idxs(ts_n, self.rando_divs):
+            for k in self._get_data_subset_idxs(ts_n, self.rando_ts_len):
                 yield ts[L:L+k]
                 L += k
 
@@ -133,11 +137,28 @@ class DynamicEEGDataset(Dataset):
 
     def load(self):
         num_examples = 0
+        max_val = None
+        min_val = None
         with open(self.cache_fname, 'w', encoding='utf-8') as cf:
             for ts_sub in self.get_data_subsets():
                 cf.write(self._ts_to_str(ts_sub) + "\n")
                 num_examples += 1
+
+                current_min_val = min([min(time_step) for time_step in ts_sub])
+                if min_val is None:
+                    min_val = current_min_val
+                elif current_min_val < min_val:
+                    min_val = current_min_val
+
+                current_max_val = min([min(time_step) for time_step in ts_sub])
+                if max_val is None:
+                    max_val = current_max_val
+                elif current_max_val > max_val:
+                    max_val = current_max_val
+
         self.data_size = num_examples
+        self.min_val = min_val
+        self.max_val = max_val
 
 
 class BatchProcessor(object):
@@ -149,12 +170,11 @@ class BatchProcessor(object):
 class EEGProcessor(BatchProcessor):
     def __init__(self,
                  sort: bool = True,
-                 gpu: bool = False,
-                 padval: float = 0.0
+                 gpu: bool = False
                  ):
         self.sort = sort
         self.gpu = gpu
-        self.padval = padval
+        self.padval = C.padval
 
     def process(self, batch):
         if self.sort:
@@ -162,7 +182,7 @@ class EEGProcessor(BatchProcessor):
 
         feature_size = len(batch[0][0])
         seq_lens = [len(batch[i]) for i in range(len(batch))]
-        max_len = max()
+        max_len = max(seq_lens)
         pad_batch = [batch[i] + [[self.padval] * feature_size] * (max_len - len(batch[i])) for i in range(len(batch))]
 
         pad_batch = torch.FloatTensor(pad_batch)
@@ -221,6 +241,8 @@ def preprocess_data(data_fname="", data_name="seizure", output_dir="./data", fea
 
 
 def test_dataset():
+    from torch.utils.data import DataLoader
+
     seizure_fname = "./data/seizure_data.pkl"
     processed_seizure_fname = "./data/seizure.timeseries.txt"
     processed_seizure_divisions_fname = "./data/seizure.divisions.json"
@@ -238,7 +260,7 @@ def test_dataset():
         p,
         min_seq_len=4,
         max_seq_len=6,
-        rando_divs=True,
+        rando_ts_len=False,
         cache_dir="./data",
         cache_name="TEST",
         delete_cache=True
@@ -260,6 +282,28 @@ def test_dataset():
 
 
 if __name__ == "__main__":
-    from torch.utils.data import DataLoader
+    from argparse import ArgumentParser
 
-    test_dataset()
+    argparser = ArgumentParser()
+    argparser.add_argument("--data_path", help="Path to data pickle file.")
+    argparser.add_argument("--data_name", choices=["seizure", "normal"], help="Name of data.")
+    argparser.add_argument("--output_path", help="Path to directory where the preprocessed data will be saved.")
+    argparser.add_argument("--feature_size", default=128, type=int, help="Batch size.")
+
+    args = argparser.parse_args()
+
+    data_path = args.data_path
+    assert data_path and os.path.isdir(data_path), "Data path is required"
+
+    data_name = args.data_name
+    assert data_name and os.path.isdir(data_name), "Data name is required"
+
+    output_path = args.output_path
+    assert output_path and os.path.isdir(output_path), "Data path is required"
+
+    preprocess_data(
+        data_fname=data_path,
+        data_name=data_name,
+        output_dir=output_path,
+        feature_size=args.feature_size
+    )
