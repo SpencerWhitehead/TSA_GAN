@@ -1,3 +1,9 @@
+#!/usr/bin/env python
+"""
+author: Spencer Whitehead
+email: srwhitehead31@gmail.com
+"""
+
 import os
 import time
 import logging
@@ -41,6 +47,9 @@ argparser.add_argument("--data_cache_dir", default="./data", help="Path to the d
 argparser.add_argument("--log", help="Path to directory where the log will be saved.")
 argparser.add_argument("--model", help="Path to directory where the model will be saved.")
 argparser.add_argument("--results", help="Path to directory where the results will be saved.")
+argparser.add_argument("--pretrained_kalman", default="", help="Path to the pretrained Kalman filter file.")
+argparser.add_argument("--fine_tune_kalman", action="store_true",
+                       help="Fine tune Kalman transition matrix.")
 argparser.add_argument("--batch_size", default=32, type=int, help="Batch size.")
 argparser.add_argument("--max_epoch", default=100, type=int)
 argparser.add_argument("--min_seq_len", default=50, type=int, help="Min sequence length in data.")
@@ -83,13 +92,11 @@ argparser.add_argument("--device", default=0, type=int)
 argparser.add_argument("--thread", default=5, type=int)
 argparser.add_argument("--delete_cache", action="store_true")
 argparser.add_argument("--use_prediction_loss", action="store_true",
-                       help="Whether or not to use MSE loss on predicted time series.")
+                       help="Use MSE loss on predicted time series.")
 argparser.add_argument("--use_cond", action="store_true",
-                       help="Whether or not to use a conditional vector.")
+                       help="Use a conditional vector.")
 argparser.add_argument("--use_1hot_cond", action="store_true",
-                       help="If using a conditional vector, whether or not to use 1-hot conditional vector.")
-argparser.add_argument("--use_kalman", action="store_true",
-                       help="Whether or not to use a Kalman filter matrix at the output of the generator.")
+                       help="If using a conditional vector, use 1-hot conditional vector.")
 
 args = argparser.parse_args()
 
@@ -176,7 +183,9 @@ gen_net = GeneratorRNN(
     rnn_cell_type="ylstm",
     dropout_p=args.gen_dropout_p,
     noise_size=args.noise_size,
-    cond_size=args.cond_size
+    cond_size=args.cond_size,
+    pretrained_kalman_transition=args.pretrained_kalman,
+    fine_tune_kalman=args.fine_tune_kalman
 )
 
 disc_model_type = FCDiscriminator if args.disc_model_type == "fc" else RNNDiscriminator
@@ -328,8 +337,8 @@ try:
         # Discriminator learning rate decay
         disc_lr = args.disc_lr * args.decay_rate ** (global_step / args.decay_step)
         for p in disc_optimizer.param_groups:
-            p["lr"] = lr
-        logger.info("New discriminator learning rate: {}".format(lr))
+            p["lr"] = disc_lr
+        logger.info("New discriminator learning rate: {}".format(disc_lr))
 
     logger.info("Best dev loss: {}".format(best_dev_loss))
     logger.info("Best test loss: {}".format(best_test_loss))

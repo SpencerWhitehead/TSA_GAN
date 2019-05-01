@@ -1,3 +1,9 @@
+#!/usr/bin/env python
+"""
+author: Spencer Whitehead
+email: srwhitehead31@gmail.com
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.init as I
@@ -103,6 +109,31 @@ class LSTM(nn.LSTM):
                 p[bias_size // 4:bias_size // 2].fill_(self.forget_bias)
 
 
+class KalmanTransition(nn.Module):
+    def __init__(self, pretrained_kalman_fname, fine_tune=False):
+        super(KalmanTransition, self).__init__()
+        self.weight = nn.Parameter(
+            self._load_kalman(pretrained_kalman_fname), requires_grad=fine_tune
+        )
+        self.register_parameter("weight", self.weight)
+        self.in_features, self.out_features = self.weight.size()
+
+    def _load_kalman(self, pretrained_fname):
+        with open(pretrained_fname, "r", encoding="utf-8") as pkf:
+            kalman_str = pkf.readlines()
+            kalman_data = list(list(map(float, row.strip().split())) for row in kalman_str)
+        return torch.transpose(torch.FloatTensor(kalman_data), 0, 1)
+
+    def forward(self, inputs):
+        outputs = torch.matmul(inputs, self.weight)
+        return outputs + torch.randn_like(outputs, requires_grad=True)
+
+    def extra_repr(self):
+        return 'in_features={}, out_features={}'.format(
+            self.in_features, self.out_features
+        )
+
+
 class BaseRNN(nn.Module):
     def __init__(self, input_size, hidden_size, n_layers, rnn_cell_type="ylstm"):
         super(BaseRNN, self).__init__()
@@ -194,7 +225,8 @@ class GeneratorRNN(BaseRNN):
                  dropout_p: float = 0.,
                  noise_size: int = 0,
                  cond_size: int = 0,
-                 use_kalman: bool = False
+                 pretrained_kalman_transition: str = "",
+                 fine_tune_kalman: bool = False
                  ):
         super(GeneratorRNN, self).__init__(input_size, hidden_size, n_layers, rnn_cell_type)
         self.output_size = output_size
@@ -210,9 +242,15 @@ class GeneratorRNN(BaseRNN):
         )
         self.out_layer = Linear(hidden_size, output_size)
 
+        self.kalman_transition = None
+        if pretrained_kalman_transition:
+            self.kalman_transition = KalmanTransition(pretrained_kalman_transition, fine_tune_kalman)
+
     def forward(self, inputs, init_hidden):
         out_states, hidden = self.rnn(inputs, init_hidden)
         outputs = self.out_layer(out_states.contiguous())
+        if self.kalman_transition:
+            outputs = self.kalman_transition(outputs)
         return outputs, hidden
 
 

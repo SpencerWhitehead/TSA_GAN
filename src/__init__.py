@@ -1,1 +1,1 @@
-__author__ = "Spencer Whitehead (whites5@rpi.edu)"
+__author__ = "Spencer Whitehead (srwhitehead31@gmail.com)"
