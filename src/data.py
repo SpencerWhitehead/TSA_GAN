@@ -1,3 +1,9 @@
+#!/usr/bin/env python
+"""
+author: Spencer Whitehead
+email: srwhitehead31@gmail.com
+"""
+
 import os
 import torch
 import random
