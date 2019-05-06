@@ -97,6 +97,8 @@ argparser.add_argument("--use_cond", action="store_true",
                        help="Use a conditional vector.")
 argparser.add_argument("--use_1hot_cond", action="store_true",
                        help="If using a conditional vector, use 1-hot conditional vector.")
+argparser.add_argument("--norm_range", nargs=2, default=[None, None], type=float,
+                       help="Normalization range of dataset.")
 
 args = argparser.parse_args()
 
@@ -137,6 +139,7 @@ train_set = DynamicEEGDataset(
     args.train[1],
     "train",
     parser,
+    normrange=args.norm_range,
     min_seq_len=args.min_seq_len,
     max_seq_len=args.max_seq_len,
     rando_ts_len=args.rand_seq_len,
@@ -150,6 +153,7 @@ dev_set = DynamicEEGDataset(
     args.dev[1],
     "dev",
     parser,
+    normrange=args.norm_range,
     min_seq_len=args.min_seq_len,
     max_seq_len=args.max_seq_len,
     rando_ts_len=args.rand_seq_len,
@@ -163,6 +167,7 @@ test_set = DynamicEEGDataset(
     args.test[1],
     "test",
     parser,
+    normrange=args.norm_range,
     min_seq_len=args.min_seq_len,
     max_seq_len=args.max_seq_len,
     rando_ts_len=args.rand_seq_len,

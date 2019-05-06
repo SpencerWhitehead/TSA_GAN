@@ -12,6 +12,8 @@ import pickle
 import json
 import logging
 
+from typing import List
+
 from torch.utils.data import Dataset
 
 import src.constants as C
@@ -63,6 +65,7 @@ class DynamicEEGDataset(Dataset):
                  div_path: str,
                  phase_str: str,
                  parser: Parser,
+                 normrange: List[float],
                  min_seq_len: int = 10,
                  max_seq_len: int = -1,
                  rando_ts_len: bool = False,
@@ -74,6 +77,10 @@ class DynamicEEGDataset(Dataset):
         self.parser = parser
         self.min_seq_len = min_seq_len
         self.max_seq_len = max_seq_len
+        if normrange:
+            self.norm_a, self.norm_b = sorted(normrange)
+        else:
+            self.norm_a, self.norm_b = None, None
         self.rando_ts_len = rando_ts_len
         self.data_size = 0
         self.min_val = None
@@ -100,7 +107,7 @@ class DynamicEEGDataset(Dataset):
             print("IDX: {}".format(idx))
             print("Line: {}".format(line))
             raise ValueError("Dataset indexing error.")
-        return self._ts_to_float(ts_str_list)
+        return self._normalize_ts(self._ts_to_float(ts_str_list))
 
     def __len__(self):
         return self.data_size
@@ -140,6 +147,18 @@ class DynamicEEGDataset(Dataset):
 
     def _ts_to_float(self, ts_str_list):
         return list(list(map(float, ts_step.split())) for ts_step in ts_str_list)
+
+    def _normalize_ts(self, ts_sub):
+        if self.norm_a is not None and self.norm_b is not None:
+            norm_ts_sub = []
+            for ts_sub_step in ts_sub:
+                norm_ts_sub.append(
+                    [((self.norm_b - self.norm_a) * (x - self.min_val) / (self.max_val - self.min_val)) + self.norm_a
+                     for x in ts_sub_step]
+                )
+        else:
+            norm_ts_sub = ts_sub
+        return norm_ts_sub
 
     def load(self):
         num_examples = 0
